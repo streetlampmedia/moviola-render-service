@@ -236,7 +236,76 @@ def _do_render(job_id: str):
             out_path = os.path.join(tmpdir, "final.mp4")
 
             set_job(job_id, progress=0.35)
-            run_ffmpeg_concat(trims, out_path)
+            def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
+    tmpdir = os.path.dirname(out_path)
+    os.makedirs(tmpdir, exist_ok=True)
+
+    # If only one segment, don't concat — just trim directly (most reliable)
+    if len(trims) == 1:
+        seg = trims[0]
+        in_path = os.path.join(tmpdir, "input_0.mp4")
+        download_file(seg["src"], in_path)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(seg["in"]),
+            "-to", str(seg["out"]),
+            "-i", in_path,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "22",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            out_path
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return
+
+    # Multiple segments: create uniform segments then concat (re-encode for reliability)
+    segment_paths = []
+    for idx, seg in enumerate(trims):
+        in_path = os.path.join(tmpdir, f"input_{idx}.mp4")
+        seg_path = os.path.join(tmpdir, f"seg_{idx}.mp4")
+
+        download_file(seg["src"], in_path)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(seg["in"]),
+            "-to", str(seg["out"]),
+            "-i", in_path,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "22",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            seg_path
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        segment_paths.append(seg_path)
+
+    list_path = os.path.join(tmpdir, "concat.txt")
+    with open(list_path, "w") as f:
+        for p in segment_paths:
+            f.write(f"file {p}\n")
+
+    cmd_concat = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_path,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "22",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        out_path
+    ]
+    subprocess.run(cmd_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
 
             set_job(job_id, status="uploading", progress=0.8)
             if callback_url:
