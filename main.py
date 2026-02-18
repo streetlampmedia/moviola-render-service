@@ -98,6 +98,11 @@ def download_file(url: str, dest_path: str):
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     f.write(chunk)
+def run_cmd(cmd: List[str]) -> None:
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        stderr = (p.stderr or b"").decode("utf-8", errors="ignore")
+        raise subprocess.CalledProcessError(p.returncode, cmd, output=p.stdout, stderr=p.stderr)
 
 def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
     """
