@@ -12,6 +12,30 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Moviola Render Service", version="0.1.0")
 
+from fastapi import Request
+
+RENDER_API_KEY = os.getenv("RENDER_API_KEY")  # set in Railway
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    path = request.url.path
+
+    # Allow health without auth
+    if path == "/health":
+        return await call_next(request)
+
+    # Protect render endpoints
+    if path == "/render" or path.startswith("/render/"):
+        if not RENDER_API_KEY:
+            # Fail closed if you forgot to set the env var in production
+            raise HTTPException(status_code=500, detail="RENDER_API_KEY not configured")
+
+        provided = request.headers.get("X-RENDER-KEY")
+        if provided != RENDER_API_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    return await call_next(request)
+
 Status = Literal["queued", "processing", "uploading", "completed", "failed"]
 
 # In-memory job store (MVP). Later: Redis/DB.
