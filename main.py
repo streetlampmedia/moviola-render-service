@@ -7,13 +7,15 @@ from typing import Optional, List, Literal, Dict, Any
 
 import boto3
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="Moviola Render Service", version="0.1.0")
 
-from fastapi import Request
-
+# =========================
+# API key protection
+# =========================
 RENDER_API_KEY = os.getenv("RENDER_API_KEY")  # set in Railway
 
 @app.middleware("http")
@@ -28,11 +30,14 @@ async def require_api_key(request: Request, call_next):
     if path == "/render" or path.startswith("/render/"):
         if not RENDER_API_KEY:
             # Fail closed if you forgot to set the env var in production
-            raise HTTPException(status_code=500, detail="RENDER_API_KEY not configured")
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "RENDER_API_KEY not configured"},
+            )
 
         provided = request.headers.get("X-RENDER-KEY")
         if provided != RENDER_API_KEY:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
     return await call_next(request)
 
@@ -278,6 +283,7 @@ def post_callback(callback_url: str, callback_secret: Optional[str], payload: di
     try:
         requests.post(callback_url, json=payload, headers=headers, timeout=30).raise_for_status()
     except Exception:
+        # Non-fatal for MVP
         pass
 
 def set_job(job_id: str, **updates):
@@ -333,7 +339,10 @@ def render_status(job_id: str):
 
 # ---------- Worker ----------
 def _do_render(job_id: str):
-    job = JOBS[job_id]
+    job = JOBS.get(job_id)
+    if not job:
+        return
+
     req = job["req"]
     callback_url = req.get("callback_url")
     callback_secret = req.get("callback_secret")
@@ -368,12 +377,14 @@ def _do_render(job_id: str):
                     "error": None
                 })
 
-            # ✅ Correct indentation: this must be inside the tempfile block
-            user_id = (req.get("job_meta") or {}).get("user_id", "demo")
-            project_id = (req.get("job_meta") or {}).get("project_id", "project")
-            key = f"renders/{user_id}/{project_id}/{job_id}.mp4"
+            # SAFE job_meta handling (fixes 500 when job_meta is null)
+            job_meta = req.get("job_meta") or {}
+            user_id = job_meta.get("user_id", "demo")
+            project_id = job_meta.get("project_id", "project")
 
+            key = f"renders/{user_id}/{project_id}/{job_id}.mp4"
             output_url = upload_to_r2(out_path, key)
+
             file_size_bytes = os.path.getsize(out_path)
             duration_seconds = get_duration_seconds(out_path)
 
