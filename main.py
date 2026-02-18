@@ -66,6 +66,8 @@ class RenderStatusResponse(BaseModel):
     progress: float = 0.0
     output_url: Optional[str] = None
     error: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    file_size_bytes: Optional[int] = None
 
 
 # ---------- Helpers ----------
@@ -115,6 +117,27 @@ def run_cmd(cmd: List[str]) -> None:
         raise subprocess.CalledProcessError(
             p.returncode, cmd, output=p.stdout, stderr=p.stderr
         )
+
+
+def get_duration_seconds(path: str) -> Optional[float]:
+    # Uses ffprobe to extract duration; returns None if it fails.
+    probe_cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    p = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        return None
+    s = (p.stdout or b"").decode("utf-8", errors="ignore").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
 def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
@@ -209,8 +232,8 @@ def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
 
     list_path = os.path.join(tmpdir, "concat.txt")
     with open(list_path, "w") as f:
-        for p in segment_paths:
-            f.write(f"file '{p}'\n")
+        for pth in segment_paths:
+            f.write(f"file '{pth}'\n")
 
     cmd_concat = [
         "ffmpeg",
@@ -248,7 +271,9 @@ def post_callback(callback_url: str, callback_secret: Optional[str], payload: di
     if callback_secret:
         headers["X-RENDER-CALLBACK-SECRET"] = callback_secret
     try:
-        requests.post(callback_url, json=payload, headers=headers, timeout=30).raise_for_status()
+        requests.post(
+            callback_url, json=payload, headers=headers, timeout=30
+        ).raise_for_status()
     except Exception:
         pass
 
@@ -275,6 +300,8 @@ def start_render(req: RenderRequest):
         "progress": 0.0,
         "output_url": None,
         "error": None,
+        "duration_seconds": None,
+        "file_size_bytes": None,
         "created_at": time.time(),
         "updated_at": time.time(),
         "req": req.model_dump(by_alias=True),
@@ -298,6 +325,8 @@ def render_status(job_id: str):
         "progress": job.get("progress", 0.0),
         "output_url": job.get("output_url"),
         "error": job.get("error"),
+        "duration_seconds": job.get("duration_seconds"),
+        "file_size_bytes": job.get("file_size_bytes"),
     }
 
 
@@ -349,10 +378,22 @@ def _do_render(job_id: str):
                     },
                 )
 
-            key = f"renders/{job_id}.mp4"
-            output_url = upload_to_r2(out_path, key)
+            user_id = (req.get("job_meta") or {}).get("user_id", "demo")
+            key = f"renders/{user_id}/{job_id}.mp4"
 
-        set_job(job_id, status="completed", progress=1.0, output_url=output_url)
+            output_url = upload_to_r2(out_path, key)
+            file_size_bytes = os.path.getsize(out_path)
+            duration_seconds = get_duration_seconds(out_path)
+
+        set_job(
+            job_id,
+            status="completed",
+            progress=1.0,
+            output_url=output_url,
+            file_size_bytes=file_size_bytes,
+            duration_seconds=duration_seconds,
+        )
+
         if callback_url:
             post_callback(
                 callback_url,
@@ -362,12 +403,18 @@ def _do_render(job_id: str):
                     "status": "completed",
                     "progress": 1.0,
                     "output_url": output_url,
+                    "file_size_bytes": file_size_bytes,
+                    "duration_seconds": duration_seconds,
                     "error": None,
                 },
             )
 
     except subprocess.CalledProcessError as e:
-        raw = e.stderr if isinstance(e.stderr, (bytes, bytearray)) else (str(e.stderr).encode("utf-8") if e.stderr else b"")
+        raw = (
+            e.stderr
+            if isinstance(e.stderr, (bytes, bytearray))
+            else (str(e.stderr).encode("utf-8") if e.stderr else b"")
+        )
         err = raw.decode("utf-8", errors="ignore").strip()
         if not err:
             err = str(e)
