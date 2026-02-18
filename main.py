@@ -1,8 +1,6 @@
 import os
 import uuid
-import json
 import time
-import shutil
 import tempfile
 import subprocess
 from typing import Optional, List, Literal, Dict, Any
@@ -22,15 +20,15 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 # ---------- Models ----------
 class TimelineClip(BaseModel):
     type: Literal["clip"] = "clip"
-    src: str  # signed URL
+    src: str  # signed/public URL
     in_: float = Field(..., alias="in")
     out: float
 
 class AudioSpec(BaseModel):
-    normalize: bool = True
+    normalize: bool = True  # MVP: not implemented yet
 
 class CaptionsSpec(BaseModel):
-    srt_url: Optional[str] = None
+    srt_url: Optional[str] = None  # MVP: not implemented
     burn_in: bool = False  # MVP: not implemented
 
 class OutputSpec(BaseModel):
@@ -84,7 +82,7 @@ def get_s3_client():
 
 def upload_to_r2(local_path: str, key: str) -> str:
     bucket = env_required("R2_BUCKET")
-    public_base = os.getenv("R2_PUBLIC_BASE_URL")  # optional (e.g. https://cdn.yourdomain.com)
+    public_base = os.getenv("R2_PUBLIC_BASE_URL")  # e.g. https://pub-xxxxx.r2.dev or https://cdn.yourdomain.com
     s3 = get_s3_client()
     s3.upload_file(local_path, bucket, key, ExtraArgs={"ContentType": "video/mp4"})
     if public_base:
@@ -94,7 +92,7 @@ def upload_to_r2(local_path: str, key: str) -> str:
 
 def download_file(url: str, dest_path: str):
     # Simple streaming download; works with signed URLs.
-    with requests.get(url, stream=True, timeout=120) as r:
+    with requests.get(url, stream=True, timeout=180) as r:
         r.raise_for_status()
         with open(dest_path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -103,28 +101,49 @@ def download_file(url: str, dest_path: str):
 
 def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
     """
-    MVP strategy:
-    - For each segment: re-encode to a common format (H.264/AAC), 30fps-ish default, +faststart.
-    - Concatenate via concat demuxer.
+    Fixes MVP reliability:
+    - If only 1 clip: trim directly to out_path (no concat).
+    - If multiple clips: trim each to normalized mp4 segments, then concat by re-encoding final.
+      (Avoids -c copy edge cases.)
     """
     tmpdir = os.path.dirname(out_path)
-    segment_paths = []
+    os.makedirs(tmpdir, exist_ok=True)
 
+    # ---- Single segment: avoid concat completely ----
+    if len(trims) == 1:
+        seg = trims[0]
+        in_path = os.path.join(tmpdir, "input_0.mp4")
+
+        download_file(seg["src"], in_path)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(seg["in"]),
+            "-to", str(seg["out"]),
+            "-i", in_path,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "22",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            out_path
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return
+
+    # ---- Multiple segments: trim to uniform segments ----
+    segment_paths: List[str] = []
     for idx, seg in enumerate(trims):
-        src = seg["src"]
-        ss = seg["in"]
-        to = seg["out"]
-
         in_path = os.path.join(tmpdir, f"input_{idx}.mp4")
         seg_path = os.path.join(tmpdir, f"seg_{idx}.mp4")
 
-        download_file(src, in_path)
+        download_file(seg["src"], in_path)
 
-        # Reliable trim: re-encode
         cmd = [
             "ffmpeg", "-y",
-            "-ss", str(ss),
-            "-to", str(to),
+            "-ss", str(seg["in"]),
+            "-to", str(seg["out"]),
             "-i", in_path,
             "-c:v", "libx264",
             "-preset", "veryfast",
@@ -137,18 +156,23 @@ def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         segment_paths.append(seg_path)
 
-    # Create concat list
+    # Concat list
     list_path = os.path.join(tmpdir, "concat.txt")
     with open(list_path, "w") as f:
         for p in segment_paths:
             f.write(f"file '{p}'\n")
 
+    # Re-encode final output for reliability
     cmd_concat = [
         "ffmpeg", "-y",
         "-f", "concat",
         "-safe", "0",
         "-i", list_path,
-        "-c", "copy",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "22",
+        "-c:a", "aac",
+        "-b:a", "128k",
         "-movflags", "+faststart",
         out_path
     ]
@@ -190,7 +214,6 @@ def start_render(req: RenderRequest):
     }
 
     # Fire-and-forget background render (MVP)
-    # Railway container is long-running, so this is fine for now.
     import threading
     threading.Thread(target=_do_render, args=(job_id,), daemon=True).start()
 
@@ -228,84 +251,13 @@ def _do_render(job_id: str):
             })
 
         edit_plan = req["edit_plan"]
-        trims = []
-        for clip in edit_plan["timeline"]:
-            trims.append({"src": clip["src"], "in": clip["in"], "out": clip["out"]})
+        trims = [{"src": clip["src"], "in": clip["in"], "out": clip["out"]} for clip in edit_plan["timeline"]]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = os.path.join(tmpdir, "final.mp4")
 
             set_job(job_id, progress=0.35)
-            def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
-    tmpdir = os.path.dirname(out_path)
-    os.makedirs(tmpdir, exist_ok=True)
-
-    # If only one segment, don't concat — just trim directly (most reliable)
-    if len(trims) == 1:
-        seg = trims[0]
-        in_path = os.path.join(tmpdir, "input_0.mp4")
-        download_file(seg["src"], in_path)
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(seg["in"]),
-            "-to", str(seg["out"]),
-            "-i", in_path,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "22",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            out_path
-        ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return
-
-    # Multiple segments: create uniform segments then concat (re-encode for reliability)
-    segment_paths = []
-    for idx, seg in enumerate(trims):
-        in_path = os.path.join(tmpdir, f"input_{idx}.mp4")
-        seg_path = os.path.join(tmpdir, f"seg_{idx}.mp4")
-
-        download_file(seg["src"], in_path)
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(seg["in"]),
-            "-to", str(seg["out"]),
-            "-i", in_path,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "22",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            seg_path
-        ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        segment_paths.append(seg_path)
-
-    list_path = os.path.join(tmpdir, "concat.txt")
-    with open(list_path, "w") as f:
-        for p in segment_paths:
-            f.write(f"file {p}\n")
-
-    cmd_concat = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_path,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "22",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        out_path
-    ]
-    subprocess.run(cmd_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
+            run_ffmpeg_concat(trims, out_path)
 
             set_job(job_id, status="uploading", progress=0.8)
             if callback_url:
@@ -317,7 +269,6 @@ def _do_render(job_id: str):
                     "error": None
                 })
 
-            # Upload
             key = f"renders/{job_id}.mp4"
             output_url = upload_to_r2(out_path, key)
 
@@ -332,7 +283,7 @@ def _do_render(job_id: str):
             })
 
     except subprocess.CalledProcessError as e:
-        err = (e.stderr or b"").decode("utf-8", errors="ignore")[-2000:]
+        err = (e.stderr or b"").decode("utf-8", errors="ignore")[-4000:]
         set_job(job_id, status="failed", error=err)
         if callback_url:
             post_callback(callback_url, callback_secret, {
