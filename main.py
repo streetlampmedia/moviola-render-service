@@ -104,4 +104,302 @@ def download_file(url: str, dest_path: str):
     with requests.get(url, stream=True, timeout=180) as r:
         r.raise_for_status()
         with open(dest_path, "wb") as f:
-            for ch
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+
+def run_cmd(cmd: List[str]) -> None:
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise subprocess.CalledProcessError(
+            p.returncode, cmd, output=p.stdout, stderr=p.stderr
+        )
+
+
+def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
+    """
+    Reliable MVP:
+    - 1 clip: trim directly (no concat).
+    - multi clips: trim each to normalized segments, then concat by re-encoding final.
+    """
+    tmpdir = os.path.dirname(out_path)
+    os.makedirs(tmpdir, exist_ok=True)
+
+    def norm_filters() -> List[str]:
+        return ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-r", "30"]
+
+    # Single clip
+    if len(trims) == 1:
+        seg = trims[0]
+        in_path = os.path.join(tmpdir, "input_0.mp4")
+        download_file(seg["src"], in_path)
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            str(seg["in"]),
+            "-to",
+            str(seg["out"]),
+            "-i",
+            in_path,
+            *norm_filters(),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "22",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            out_path,
+        ]
+        run_cmd(cmd)
+        return
+
+    # Multiple clips -> segments
+    segment_paths: List[str] = []
+    for idx, seg in enumerate(trims):
+        in_path = os.path.join(tmpdir, f"input_{idx}.mp4")
+        seg_path = os.path.join(tmpdir, f"seg_{idx}.mp4")
+
+        download_file(seg["src"], in_path)
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            str(seg["in"]),
+            "-to",
+            str(seg["out"]),
+            "-i",
+            in_path,
+            *norm_filters(),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "22",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            seg_path,
+        ]
+        run_cmd(cmd)
+        segment_paths.append(seg_path)
+
+    list_path = os.path.join(tmpdir, "concat.txt")
+    with open(list_path, "w") as f:
+        for p in segment_paths:
+            f.write(f"file '{p}'\n")
+
+    cmd_concat = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        list_path,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        out_path,
+    ]
+    run_cmd(cmd_concat)
+
+
+def post_callback(callback_url: str, callback_secret: Optional[str], payload: dict):
+    headers = {}
+    if callback_secret:
+        headers["X-RENDER-CALLBACK-SECRET"] = callback_secret
+    try:
+        requests.post(callback_url, json=payload, headers=headers, timeout=30).raise_for_status()
+    except Exception:
+        pass
+
+
+def set_job(job_id: str, **updates):
+    JOBS[job_id].update(updates)
+    JOBS[job_id]["updated_at"] = time.time()
+
+
+# ---------- API ----------
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.post("/render", response_model=RenderResponse)
+def start_render(req: RenderRequest):
+    if not req.edit_plan.timeline:
+        raise HTTPException(400, "edit_plan.timeline is empty")
+
+    job_id = uuid.uuid4().hex[:12]
+    JOBS[job_id] = {
+        "status": "queued",
+        "progress": 0.0,
+        "output_url": None,
+        "error": None,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "req": req.model_dump(by_alias=True),
+    }
+
+    import threading
+    threading.Thread(target=_do_render, args=(job_id,), daemon=True).start()
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/render/{job_id}", response_model=RenderStatusResponse)
+def render_status(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "progress": job.get("progress", 0.0),
+        "output_url": job.get("output_url"),
+        "error": job.get("error"),
+    }
+
+
+# ---------- Worker ----------
+def _do_render(job_id: str):
+    job = JOBS[job_id]
+    req = job["req"]
+    callback_url = req.get("callback_url")
+    callback_secret = req.get("callback_secret")
+
+    try:
+        set_job(job_id, status="processing", progress=0.05)
+        if callback_url:
+            post_callback(
+                callback_url,
+                callback_secret,
+                {
+                    "external_job_id": job_id,
+                    "status": "processing",
+                    "progress": 0.05,
+                    "output_url": None,
+                    "error": None,
+                },
+            )
+
+        edit_plan = req["edit_plan"]
+        trims = [
+            {"src": clip["src"], "in": clip["in"], "out": clip["out"]}
+            for clip in edit_plan["timeline"]
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = os.path.join(tmpdir, "final.mp4")
+
+            set_job(job_id, progress=0.35)
+            run_ffmpeg_concat(trims, out_path)
+
+            set_job(job_id, status="uploading", progress=0.8)
+            if callback_url:
+                post_callback(
+                    callback_url,
+                    callback_secret,
+                    {
+                        "external_job_id": job_id,
+                        "status": "uploading",
+                        "progress": 0.8,
+                        "output_url": None,
+                        "error": None,
+                    },
+                )
+
+            key = f"renders/{job_id}.mp4"
+            output_url = upload_to_r2(out_path, key)
+
+        set_job(job_id, status="completed", progress=1.0, output_url=output_url)
+        if callback_url:
+            post_callback(
+                callback_url,
+                callback_secret,
+                {
+                    "external_job_id": job_id,
+                    "status": "completed",
+                    "progress": 1.0,
+                    "output_url": output_url,
+                    "error": None,
+                },
+            )
+
+    except subprocess.CalledProcessError as e:
+        raw = e.stderr if isinstance(e.stderr, (bytes, bytearray)) else (str(e.stderr).encode("utf-8") if e.stderr else b"")
+        err = raw.decode("utf-8", errors="ignore").strip()
+        if not err:
+            err = str(e)
+        err = err[-4000:]
+
+        set_job(job_id, status="failed", error=err)
+        if callback_url:
+            post_callback(
+                callback_url,
+                callback_secret,
+                {
+                    "external_job_id": job_id,
+                    "status": "failed",
+                    "progress": job.get("progress", 0.0),
+                    "output_url": None,
+                    "error": err,
+                },
+            )
+
+    except Exception as e:
+        err = str(e)
+
+        set_job(job_id, status="failed", error=err)
+        if callback_url:
+            post_callback(
+                callback_url,
+                callback_secret,
+                {
+                    "external_job_id": job_id,
+                    "status": "failed",
+                    "progress": job.get("progress", 0.0),
+                    "output_url": None,
+                    "error": err,
+                },
+            )
