@@ -18,6 +18,7 @@ app = FastAPI(title="Moviola Render Service", version="0.1.0")
 # =========================
 RENDER_API_KEY = os.getenv("RENDER_API_KEY")  # set in Railway
 
+
 @app.middleware("http")
 async def require_api_key(request: Request, call_next):
     path = request.url.path
@@ -35,11 +36,29 @@ async def require_api_key(request: Request, call_next):
                 content={"detail": "RENDER_API_KEY not configured"},
             )
 
-        provided = request.headers.get("X-RENDER-KEY")
-        if provided != RENDER_API_KEY:
+        expected = (RENDER_API_KEY or "").strip()
+
+        # Accept multiple header styles:
+        # - X-RENDER-KEY: <key>
+        # - X-API-Key: <key>        (common)
+        # - Authorization: Bearer <key> (optional)
+        provided = (
+            request.headers.get("X-RENDER-KEY")
+            or request.headers.get("X-API-Key")
+        )
+
+        if not provided:
+            auth = request.headers.get("Authorization")
+            if auth and auth.lower().startswith("bearer "):
+                provided = auth.split(" ", 1)[1]
+
+        provided = (provided or "").strip()
+
+        if provided != expected:
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
     return await call_next(request)
+
 
 Status = Literal["queued", "processing", "uploading", "completed", "failed"]
 
@@ -53,17 +72,21 @@ class TimelineClip(BaseModel):
     in_: float = Field(..., alias="in")
     out: float
 
+
 class AudioSpec(BaseModel):
     normalize: bool = True  # MVP: not implemented yet
+
 
 class CaptionsSpec(BaseModel):
     srt_url: Optional[str] = None  # MVP: not implemented
     burn_in: bool = False  # MVP: not implemented
 
+
 class OutputSpec(BaseModel):
     format: Literal["mp4"] = "mp4"
     width: int = 1920
     height: int = 1080
+
 
 class EditPlan(BaseModel):
     timeline: List[TimelineClip]
@@ -71,15 +94,18 @@ class EditPlan(BaseModel):
     captions: CaptionsSpec = CaptionsSpec()
     output: OutputSpec = OutputSpec()
 
+
 class RenderRequest(BaseModel):
     callback_url: Optional[str] = None
     callback_secret: Optional[str] = None
     job_meta: Optional[dict] = None
     edit_plan: EditPlan
 
+
 class RenderResponse(BaseModel):
     job_id: str
     status: Status
+
 
 class RenderStatusResponse(BaseModel):
     job_id: str
@@ -90,12 +116,14 @@ class RenderStatusResponse(BaseModel):
     duration_seconds: Optional[float] = None
     file_size_bytes: Optional[int] = None
 
+
 # ---------- Helpers ----------
 def env_required(name: str) -> str:
     v = os.getenv(name)
     if not v:
         raise RuntimeError(f"Missing required env var: {name}")
     return v
+
 
 def get_s3_client():
     endpoint = env_required("R2_ENDPOINT")  # https://<accountid>.r2.cloudflarestorage.com
@@ -110,6 +138,7 @@ def get_s3_client():
         region_name=region,
     )
 
+
 def upload_to_r2(local_path: str, key: str) -> str:
     bucket = env_required("R2_BUCKET")
     public_base = os.getenv("R2_PUBLIC_BASE_URL")  # e.g. https://pub-xxxxx.r2.dev
@@ -119,6 +148,7 @@ def upload_to_r2(local_path: str, key: str) -> str:
         return f"{public_base.rstrip('/')}/{key}"
     return f"s3://{bucket}/{key}"
 
+
 def download_file(url: str, dest_path: str):
     with requests.get(url, stream=True, timeout=180) as r:
         r.raise_for_status()
@@ -127,10 +157,14 @@ def download_file(url: str, dest_path: str):
                 if chunk:
                     f.write(chunk)
 
+
 def run_cmd(cmd: List[str]) -> None:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
-        raise subprocess.CalledProcessError(p.returncode, cmd, output=p.stdout, stderr=p.stderr)
+        raise subprocess.CalledProcessError(
+            p.returncode, cmd, output=p.stdout, stderr=p.stderr
+        )
+
 
 def get_duration_seconds(path: str) -> Optional[float]:
     probe_cmd = [
@@ -150,6 +184,7 @@ def get_duration_seconds(path: str) -> Optional[float]:
         return float(s)
     except Exception:
         return None
+
 
 def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
     """
@@ -276,15 +311,19 @@ def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
     ]
     run_cmd(cmd_concat)
 
+
 def post_callback(callback_url: str, callback_secret: Optional[str], payload: dict):
     headers = {}
     if callback_secret:
         headers["X-RENDER-CALLBACK-SECRET"] = callback_secret
     try:
-        requests.post(callback_url, json=payload, headers=headers, timeout=30).raise_for_status()
+        requests.post(
+            callback_url, json=payload, headers=headers, timeout=30
+        ).raise_for_status()
     except Exception:
         # Non-fatal for MVP
         pass
+
 
 def set_job(job_id: str, **updates):
     job = JOBS.get(job_id)
@@ -293,10 +332,12 @@ def set_job(job_id: str, **updates):
     job.update(updates)
     job["updated_at"] = time.time()
 
+
 # ---------- API ----------
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.post("/render", response_model=RenderResponse)
 def start_render(req: RenderRequest):
@@ -321,6 +362,7 @@ def start_render(req: RenderRequest):
 
     return {"job_id": job_id, "status": "queued"}
 
+
 @app.get("/render/{job_id}", response_model=RenderStatusResponse)
 def render_status(job_id: str):
     job = JOBS.get(job_id)
@@ -337,6 +379,7 @@ def render_status(job_id: str):
         "file_size_bytes": job.get("file_size_bytes"),
     }
 
+
 # ---------- Worker ----------
 def _do_render(job_id: str):
     job = JOBS.get(job_id)
@@ -350,16 +393,23 @@ def _do_render(job_id: str):
     try:
         set_job(job_id, status="processing", progress=0.05)
         if callback_url:
-            post_callback(callback_url, callback_secret, {
-                "external_job_id": job_id,
-                "status": "processing",
-                "progress": 0.05,
-                "output_url": None,
-                "error": None
-            })
+            post_callback(
+                callback_url,
+                callback_secret,
+                {
+                    "external_job_id": job_id,
+                    "status": "processing",
+                    "progress": 0.05,
+                    "output_url": None,
+                    "error": None,
+                },
+            )
 
         edit_plan = req["edit_plan"]
-        trims = [{"src": clip["src"], "in": clip["in"], "out": clip["out"]} for clip in edit_plan["timeline"]]
+        trims = [
+            {"src": clip["src"], "in": clip["in"], "out": clip["out"]}
+            for clip in edit_plan["timeline"]
+        ]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = os.path.join(tmpdir, "final.mp4")
@@ -369,13 +419,17 @@ def _do_render(job_id: str):
 
             set_job(job_id, status="uploading", progress=0.8)
             if callback_url:
-                post_callback(callback_url, callback_secret, {
-                    "external_job_id": job_id,
-                    "status": "uploading",
-                    "progress": 0.8,
-                    "output_url": None,
-                    "error": None
-                })
+                post_callback(
+                    callback_url,
+                    callback_secret,
+                    {
+                        "external_job_id": job_id,
+                        "status": "uploading",
+                        "progress": 0.8,
+                        "output_url": None,
+                        "error": None,
+                    },
+                )
 
             # SAFE job_meta handling (fixes 500 when job_meta is null)
             job_meta = req.get("job_meta") or {}
@@ -398,40 +452,56 @@ def _do_render(job_id: str):
         )
 
         if callback_url:
-            post_callback(callback_url, callback_secret, {
-                "external_job_id": job_id,
-                "status": "completed",
-                "progress": 1.0,
-                "output_url": output_url,
-                "file_size_bytes": file_size_bytes,
-                "duration_seconds": duration_seconds,
-                "error": None
-            })
+            post_callback(
+                callback_url,
+                callback_secret,
+                {
+                    "external_job_id": job_id,
+                    "status": "completed",
+                    "progress": 1.0,
+                    "output_url": output_url,
+                    "file_size_bytes": file_size_bytes,
+                    "duration_seconds": duration_seconds,
+                    "error": None,
+                },
+            )
 
     except subprocess.CalledProcessError as e:
-        raw = e.stderr if isinstance(e.stderr, (bytes, bytearray)) else (str(e.stderr).encode("utf-8") if e.stderr else b"")
+        raw = (
+            e.stderr
+            if isinstance(e.stderr, (bytes, bytearray))
+            else (str(e.stderr).encode("utf-8") if e.stderr else b"")
+        )
         err = raw.decode("utf-8", errors="ignore").strip() or str(e)
         err = err[-4000:]
 
         set_job(job_id, status="failed", error=err)
         if callback_url:
-            post_callback(callback_url, callback_secret, {
-                "external_job_id": job_id,
-                "status": "failed",
-                "progress": JOBS.get(job_id, {}).get("progress", 0.0),
-                "output_url": None,
-                "error": err
-            })
+            post_callback(
+                callback_url,
+                callback_secret,
+                {
+                    "external_job_id": job_id,
+                    "status": "failed",
+                    "progress": JOBS.get(job_id, {}).get("progress", 0.0),
+                    "output_url": None,
+                    "error": err,
+                },
+            )
 
     except Exception as e:
         err = str(e)
 
         set_job(job_id, status="failed", error=err)
         if callback_url:
-            post_callback(callback_url, callback_secret, {
-                "external_job_id": job_id,
-                "status": "failed",
-                "progress": JOBS.get(job_id, {}).get("progress", 0.0),
-                "output_url": None,
-                "error": err
-            })
+            post_callback(
+                callback_url,
+                callback_secret,
+                {
+                    "external_job_id": job_id,
+                    "status": "failed",
+                    "progress": JOBS.get(job_id, {}).get("progress", 0.0),
+                    "output_url": None,
+                    "error": err,
+                },
+            )
