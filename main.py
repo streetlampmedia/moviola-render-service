@@ -101,20 +101,25 @@ def download_file(url: str, dest_path: str):
 def run_cmd(cmd: List[str]) -> None:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
-        stderr = (p.stderr or b"").decode("utf-8", errors="ignore")
         raise subprocess.CalledProcessError(p.returncode, cmd, output=p.stdout, stderr=p.stderr)
 
 def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
     """
-    Fixes MVP reliability:
-    - If only 1 clip: trim directly to out_path (no concat).
-    - If multiple clips: trim each to normalized mp4 segments, then concat by re-encoding final.
-      (Avoids -c copy edge cases.)
+    Reliable MVP:
+    - 1 clip: trim directly (no concat).
+    - multi clips: trim each to normalized segments, then concat by re-encoding final.
+    Notes:
+    - Forces even dimensions, yuv420p, and 30fps for stability.
+    - Uses -hide_banner and -loglevel error to avoid noisy output.
     """
     tmpdir = os.path.dirname(out_path)
     os.makedirs(tmpdir, exist_ok=True)
 
-    # ---- Single segment: avoid concat completely ----
+    def norm_filters() -> List[str]:
+        # H.264 likes even dimensions; yuv420p avoids compatibility issues.
+        return ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-r", "30"]
+
+    # ---- Single clip: trim directly (most reliable) ----
     if len(trims) == 1:
         seg = trims[0]
         in_path = os.path.join(tmpdir, "input_0.mp4")
@@ -123,21 +128,24 @@ def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
 
         cmd = [
             "ffmpeg", "-y",
+            "-hide_banner", "-loglevel", "error",
             "-ss", str(seg["in"]),
             "-to", str(seg["out"]),
             "-i", in_path,
+            *norm_filters(),
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-crf", "22",
+            "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",
-            out_path
+            out_path,
         ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        run_cmd(cmd)
         return
 
-    # ---- Multiple segments: trim to uniform segments ----
+    # ---- Multiple clips: trim to uniform segments ----
     segment_paths: List[str] = []
     for idx, seg in enumerate(trims):
         in_path = os.path.join(tmpdir, f"input_{idx}.mp4")
@@ -147,41 +155,47 @@ def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
 
         cmd = [
             "ffmpeg", "-y",
+            "-hide_banner", "-loglevel", "error",
             "-ss", str(seg["in"]),
             "-to", str(seg["out"]),
             "-i", in_path,
+            *norm_filters(),
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-crf", "22",
+            "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",
-            seg_path
+            seg_path,
         ]
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        run_cmd(cmd)
         segment_paths.append(seg_path)
 
-    # Concat list
+    # ---- Concat list file ----
     list_path = os.path.join(tmpdir, "concat.txt")
     with open(list_path, "w") as f:
         for p in segment_paths:
             f.write(f"file '{p}'\n")
 
-    # Re-encode final output for reliability
+    # ---- Concat by re-encoding final (avoids -c copy edge cases) ----
     cmd_concat = [
         "ffmpeg", "-y",
+        "-hide_banner", "-loglevel", "error",
         "-f", "concat",
         "-safe", "0",
         "-i", list_path,
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "22",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
-        out_path
+        out_path,
     ]
-    subprocess.run(cmd_concat, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    run_cmd(cmd_concat)
+
 
 def post_callback(callback_url: str, callback_secret: Optional[str], payload: dict):
     headers = {}
