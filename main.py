@@ -378,8 +378,10 @@ def _do_render(job_id: str):
                     },
                 )
 
-            user_id = (req.get("job_meta") or {}).get("user_id", "demo")
-            key = f"renders/{user_id}/{job_id}.mp4"
+user_id = req.get("job_meta", {}).get("user_id", "demo")
+project_id = req.get("job_meta", {}).get("project_id", "project")
+key = f"renders/{user_id}/{project_id}/{job_id}.mp4"
+
 
             output_url = upload_to_r2(out_path, key)
             file_size_bytes = os.path.getsize(out_path)
