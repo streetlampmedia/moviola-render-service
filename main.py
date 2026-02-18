@@ -101,7 +101,15 @@ def download_file(url: str, dest_path: str):
 def run_cmd(cmd: List[str]) -> None:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
-        raise subprocess.CalledProcessError(p.returncode, cmd, output=p.stdout, stderr=p.stderr)
+        out = (p.stdout or b"").decode("utf-8", errors="ignore")
+        err = (p.stderr or b"").decode("utf-8", errors="ignore")
+        raise subprocess.CalledProcessError(
+            p.returncode,
+            cmd,
+            output=out.encode("utf-8"),
+            stderr=err.encode("utf-8")
+        )
+
 
 def run_ffmpeg_concat(trims: List[dict], out_path: str) -> None:
     """
@@ -301,8 +309,15 @@ def _do_render(job_id: str):
                 "error": None
             })
 
-    except subprocess.CalledProcessError as e:
-        err = (e.stderr or b"").decode("utf-8", errors="ignore")[-4000:]
+  except subprocess.CalledProcessError as e:
+    raw = e.stderr if isinstance(e.stderr, (bytes, bytearray)) else (
+        str(e.stderr).encode("utf-8") if e.stderr else b""
+    )
+    err = raw.decode("utf-8", errors="ignore").strip()
+    if not err:
+        err = str(e)
+    err = err[-4000:]
+
         set_job(job_id, status="failed", error=err)
         if callback_url:
             post_callback(callback_url, callback_secret, {
